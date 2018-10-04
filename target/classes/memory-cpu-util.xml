@@ -1,0 +1,303 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<mule xmlns:schedulers="http://www.mulesoft.org/schema/mule/schedulers" xmlns:db="http://www.mulesoft.org/schema/mule/db"
+	xmlns:metadata="http://www.mulesoft.org/schema/mule/metadata"
+	xmlns:tracking="http://www.mulesoft.org/schema/mule/ee/tracking"
+	xmlns:dw="http://www.mulesoft.org/schema/mule/ee/dw" xmlns:http="http://www.mulesoft.org/schema/mule/http"
+	xmlns="http://www.mulesoft.org/schema/mule/core" xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xmlns:spring="http://www.springframework.org/schema/beans" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="http://www.mulesoft.org/schema/mule/ee/dw http://www.mulesoft.org/schema/mule/ee/dw/current/dw.xsd
+http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+http://www.springframework.org/schema/beans http://www.springframework.org/schema/beans/spring-beans-current.xsd
+http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+http://www.mulesoft.org/schema/mule/ee/tracking http://www.mulesoft.org/schema/mule/ee/tracking/current/mule-tracking-ee.xsd
+http://www.mulesoft.org/schema/mule/db http://www.mulesoft.org/schema/mule/db/current/mule-db.xsd
+http://www.mulesoft.org/schema/mule/schedulers http://www.mulesoft.org/schema/mule/schedulers/current/mule-schedulers.xsd">
+
+	<sub-flow name="FetchApplicationsSubFlow">
+		<http:request config-ref="Access_Management_Config" path="cloudhub/api/applications"
+			method="GET" doc:name="HTTP">
+			<http:request-builder>
+				<http:header headerName="x-anypnt-env-id" value="#[payload.env_id]" />
+				<http:header headerName="x-anypnt-org-id" value="#[payload.org_id]" />
+			</http:request-builder>
+		</http:request>
+		<dw:transform-message doc:name="Transform Message">
+			<dw:input-payload doc:sample="sample_data\json.json"
+				mimeType="application/json" />
+			<dw:set-variable variableName="varApplicationsList"><![CDATA[%dw 1.0
+%output application/java
+---
+payload filter ("STARTED"==$.status) map (val, indexOfval) ->{
+	Name : val.domain,
+	Status : val.status
+}]]></dw:set-variable>
+		</dw:transform-message>
+	</sub-flow>
+	<flow name="memory-cpu-utilFlow">
+        <poll doc:name="Poll">
+            <schedulers:cron-scheduler expression="${cloud.worker.stats.scheduler}"/>
+            <logger level="INFO" doc:name="Logger"/>
+        </poll>
+		<!-- <http:listener config-ref="HTTP_Listener_Configuration" path="/get" 
+			doc:name="HTTP"/> -->
+		<message-properties-transformer scope="invocation"
+			doc:name="Message Properties">
+			<!-- <add-message-property key="beginDateTime" value="#[server.dateTime.format(&quot;yyyy-MM-dd'T'HH:mm:ss.SSS'Z'&quot;)]"/> -->
+			<add-message-property key="pageSize" value="${time.duration}" />
+			<add-message-property key="noOfPages" value="${time.noOfPages}" />
+			<add-message-property key="interval" value="${time.interval}" />
+		</message-properties-transformer>
+
+		<db:select config-ref="MySQL_Configuration" doc:name="Database">
+			<db:parameterized-query><![CDATA[SELECT app_name
+      ,org_id
+      ,env_id
+      ,env_name
+  FROM t_api_ids where toggle='ON']]></db:parameterized-query>
+		</db:select>
+		<foreach doc:name="For Each" collection="#[payload]">
+			<logger message="logger :#[flowVars.pageSize]======#[flowVars.noOfPages]"
+				level="INFO" doc:name="Logger" />
+			<set-variable variableName="envPayaload" value="#[payload]"
+				doc:name="envBasedPayload" />
+			<flow-ref name="memory-cpu-Sub_Flow" doc:name="memory-cpu-Sub_Flow" />
+		</foreach>
+        <logger message="Metrics Data successfully loaded into Database" level="INFO" doc:name="Logger"/>
+
+		<catch-exception-strategy doc:name="Catch Exception Strategy">
+			<logger message="ERROR : #[message.exception]" level="INFO"
+				doc:name="Logger" />
+		</catch-exception-strategy>
+	</flow>
+	<sub-flow name="memory-cpu-Sub_Flow">
+		<logger message="Memory Usage Check for #[payload.env_name] Environment"
+			level="INFO" doc:name="Logger" />
+		<set-variable variableName="envId" value="#[payload.env_id]"
+			doc:name="Set Env Id" />
+		<expression-component doc:name="Construct Pages List"><![CDATA[import java.text.SimpleDateFormat;
+import java.util.*;
+
+SimpleDateFormat sdf=new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'");
+sdf.setTimeZone(TimeZone.getTimeZone("${timezone}"));
+
+Calendar calender= Calendar.getInstance(TimeZone.getTimeZone("${timezone}"));
+Date beginDate = calender.getTime();
+//Calendar calender= Calendar.getInstance();
+
+//Date dateBeginTime=sdf.parse(flowVars.beginDateTime);
+Integer pageSize=Integer.parseInt(flowVars.pageSize);
+Integer noOfPages=Integer.parseInt(flowVars.noOfPages);
+
+
+Map map=new HashMap();
+Date pageFromTime = beginDate;
+for(int processedPages=0; processedPages < noOfPages; processedPages++){
+	    calender.setTime(pageFromTime);
+		calender.add(Calendar.HOUR, -pageSize);
+		Date pageToTime = calender.getTime();
+		map.put(sdf.format(pageFromTime), sdf.format(pageToTime));  
+		pageFromTime = pageToTime;
+}
+System.out.println("Map Size "+map.size());
+flowVars.pages=map;]]></expression-component>
+		<flow-ref name="FetchApplicationsSubFlow" doc:name="FetchApplicationsSubFlow" />
+		<foreach collection="#[flowVars.pages]" doc:name="Loop Each Page"
+			counterVariableName="pageCounter">
+			<message-properties-transformer scope="invocation"
+				doc:name="Message Properties">
+				<add-message-property key="pageFromTime" value="#[flowVars.key]" />
+				<add-message-property key="pageEndTime" value="#[payload]" />
+			</message-properties-transformer>
+			<foreach collection="#[flowVars.varApplicationsList]"
+				doc:name="Loop Each Application" counterVariableName="appCounter">
+				<logger message="Application Name : #[payload.Name]" level="INFO"
+					doc:name="Logger" />
+
+				<set-variable variableName="ApplicationName" value="#[payload.Name]"
+					doc:name="App Name" />
+				<flow-ref name="CloudHub-MemCPU-UtilsSub_Flow" doc:name="CloudHub-MemCPU-UtilsSub_Flow" />
+			</foreach>
+		</foreach>
+
+
+	</sub-flow>
+	<!-- <flow name="Mem-CPU-Flow" processingStrategy="synchronous"> <set-variable 
+		variableName="key" value="${env.name}" doc:name="Variable"/> <logger message="Memory 
+		Usage Check for ${env.name} Environment" level="INFO" doc:name="Logger"/> 
+		<set-variable variableName="Num" value="1" doc:name="Variable"/> <flow-ref 
+		name="CloudHub-Env-ApssSubflow" doc:name="CloudHub-Env-ApssSubflow"/> <foreach 
+		doc:name="For Each"> <logger message="Application Name : #[payload.Name]" 
+		level="INFO" doc:name="Logger"/> <set-variable variableName="countVar" value="#[flowVars.counter]" 
+		doc:name="CounterVar"/> <set-variable variableName="ApplicationName" value="#[payload.Name]" 
+		doc:name="App Name"/> <flow-ref name="CloudHub-MemCPU-UtilsSub_Flow" doc:name="CloudHub-MemCPU-UtilsSub_Flow"/> 
+		<foreach doc:name="For Each"> <expression-component doc:name="Expression"><![CDATA[if(flowVars.countVar==1){ 
+		StringBuilder builder = new StringBuilder(); builder.append("<!DOCTYPE html>"); 
+		builder.append("<html lang=\"en\">"); //builder.append("<head><style>table 
+		{border-collapse: collapse; width:80% }table, td, th {border: 2px solid black;text-align:center; 
+		}th{background-color:black;color:white;}</style></head>"); builder.append("<head> 
+		<style> table, th, td { border: 1.8px solid black; border-collapse: collapse; 
+		font-size:10px; text-align :center} </style></head>"); builder.append("<body>"); 
+		builder.append("<table style=\"width: 80%\" align=\"center\">"); builder.append("<tr 
+		bgcolor=#85a3e0\><th>S.No</th><th>ApplicationName</th><th>Worker</th><th>Minimum 
+		CPU Usage</th><th>Maximum CPU Usage</th><th>Minimum RAM Usage</th><th>Maximum 
+		RAM Usage</th></tr>"); builder.append("<tr><td>"+flowVars.Num+ "</td><td>" 
+		+ flowVars.ApplicationName + "</td><td> Worker - "+ flowVars.counter + "</td><td>" 
+		+ payload.Minimum_CPU +"</td><td>" +payload.Maximum_CPU+"</td><td>" +payload.Minimum_Ram+"</td><td>" 
+		+payload.Maximum_Ram+"</td></tr>"); flowVars.utils = builder; //System.out.println("Before 
+		: "+Integer.parsInt(flowVars.countVar)); flowVars.countVar=Integer.parseInt(flowVars.Num)+1; 
+		flowVars.Num=Integer.parseInt(flowVars.Num)+1; // System.out.println("After 
+		: "+Integer.parsInt(flowVars.countVar)+1); }else{ flowVars.utils.append("<tr><td>" 
+		+flowVars.Num+ "</td><td>" + flowVars.ApplicationName +"</td><td> Worker 
+		- "+ flowVars.counter + "</td><td>" + payload.Minimum_CPU +"</td><td>" +payload.Maximum_CPU+"</td><td>" 
+		+payload.Minimum_Ram+"</td><td>" +payload.Maximum_Ram+"</td></tr>"); flowVars.Num=Integer.parseInt(flowVars.Num)+1; 
+		}]]></expression-component> </foreach> </foreach> <set-variable variableName="varGraphs" 
+		value="#[flowVars.utils]&lt;/table&gt;&lt;/body&gt;&lt;/html&gt;" doc:name="Variable"/> 
+		<logger message="#[payload]" level="INFO" doc:name="Logger"/> </flow> -->
+	<flow name="CloudHub-MemCPU-UtilsSub_Flow">
+
+		<!-- <foreach collection="#[flowVars.collection]" counterVariableName="timeCounter" 
+			doc:name="For Each"> -->
+		<logger message="#[flowVars.pageEndTime] ======#[flowVars.pageFromTime]"
+			level="INFO" doc:name="Logger" />
+
+
+		<http:request config-ref="Access_Management_Config"
+			path="cloudhub/api/v2/applications/{appName}/dashboardStats" method="GET"
+			doc:name="HTTP">
+			<http:request-builder>
+				<http:query-param paramName="startDate"
+					value="#[flowVars.pageEndTime]" />
+				<http:query-param paramName="endDate"
+					value="#[flowVars.pageFromTime]" />
+				<http:query-param paramName="interval" value="#[flowVars.interval]" />
+				<http:uri-param paramName="appName"
+					value="#[flowVars.ApplicationName]" />
+				<http:header headerName="x-anypnt-env-id" value="#[flowVars.envPayaload.env_id]" />
+				<http:header headerName="x-anypnt-org-id" value="#[flowVars.envPayaload.org_id]" />
+
+
+
+
+
+
+
+
+			</http:request-builder>
+		</http:request>
+		<byte-array-to-string-transformer
+			doc:name="Byte Array to String" />
+		<dw:transform-message doc:name="Transform Message">
+			<dw:set-payload><![CDATA[%dw 1.0
+%output application/java
+---
+payload]]></dw:set-payload>
+			<dw:set-variable variableName="responsePayload"><![CDATA[%dw 1.0
+%output application/java
+---
+payload]]></dw:set-variable>
+		</dw:transform-message>
+
+
+		<foreach collection="#[payload.events]" counterVariableName="varEeventcounter"
+			doc:name="For Each">
+
+			<foreach collection="#[flowVars.responsePayload.workerStatistics]"
+				counterVariableName="varWorkerCounter" doc:name="For Each">
+				<dw:transform-message doc:name="Transform Message">
+					<dw:set-payload><![CDATA[%dw 1.0
+%output application/json
+---
+{
+	//counter: (flowVars.varEeventcounter as :number)-(1 as :number) ,
+	applicationName: flowVars.ApplicationName,
+	worker:"Worker " ++ flowVars.varWorkerCounter as :string,
+	startTime:flowVars.pageEndTime as :datetime as :string {format:"yyyy-MM-dd HH:mm:ss"},
+	endTime: flowVars.pageFromTime as :datetime as :string {format:"yyyy-MM-dd HH:mm:ss"},
+	timeMilli: (flowVars.responsePayload.events pluck $$) [(flowVars.varEeventcounter as :number)-(1 as :number)] when ((flowVars.responsePayload.events pluck $$) [(flowVars.varEeventcounter as :number)-(1 as :number)])!=null otherwise -2,
+	memoryPercentage: (payload.statistics.memoryPercentageUsed pluck $) [(flowVars.varEeventcounter as :number)-(1 as :number)] when ((payload.statistics.memoryPercentageUsed pluck $) [(flowVars.varEeventcounter as :number)-(1 as :number)])!=null otherwise -2 as :number,
+	memoryUsed: (payload.statistics.memoryTotalUsed pluck $) [(flowVars.varEeventcounter as :number)-(1 as :number)] when ((payload.statistics.memoryTotalUsed pluck $) [(flowVars.varEeventcounter as :number)-(1 as :number)])!=null otherwise -2 as :number,
+	cpu: (payload.statistics.cpu pluck $) [(flowVars.varEeventcounter as :number)-(1 as :number)] when ((payload.statistics.cpu pluck $) [(flowVars.varEeventcounter as :number)-(1 as :number)])!=null otherwise -2 as :number,
+	events: (flowVars.responsePayload.events pluck $) [(flowVars.varEeventcounter as :number)-(1 as :number)] when ((flowVars.responsePayload.events pluck $) [(flowVars.varEeventcounter as :number)-(1 as :number)])!=null otherwise -2,
+	eventsCount: sizeOf (flowVars.responsePayload.events pluck $$),
+	memoryCount: sizeOf (payload.statistics.memoryTotalUsed pluck $$),
+	memorypercentCount : sizeOf (payload.statistics.memoryPercentageUsed pluck $$),
+	cpuCount: sizeOf (payload.statistics.cpu pluck $$),
+	envName: flowVars.envPayaload.env_name,
+	timeStamp: (((flowVars.responsePayload.events pluck $$) [(flowVars.varEeventcounter as :number)-(1 as :number)]) as :string /1000) as :datetime as :string{format:'yyyy-MM-dd HH:mm:ss'} when ((flowVars.responsePayload.events pluck $$) [(flowVars.varEeventcounter as :number)-(1 as :number)])!=null otherwise null,
+	networkIn : (payload.statistics.networkIn pluck $) [(flowVars.varEeventcounter as :number)-(1 as :number)] when ((payload.statistics.networkIn pluck $) [(flowVars.varEeventcounter as :number)-(1 as :number)])!=null otherwise -2 as :number,
+	networkOut : (payload.statistics.networkOut pluck $) [(flowVars.varEeventcounter as :number)-(1 as :number)] when ((payload.statistics.networkOut pluck $) [(flowVars.varEeventcounter as :number)-(1 as :number)])!=null otherwise -2 as :number,
+	diskReadBytes : (payload.statistics.diskReadBytes pluck $) [(flowVars.varEeventcounter as :number)-(1 as :number)] when ((payload.statistics.diskReadBytes pluck $) [(flowVars.varEeventcounter as :number)-(1 as :number)])!=null otherwise -2 as :number,
+	diskWriteBytes : (payload.statistics.diskWriteBytes pluck $) [(flowVars.varEeventcounter as :number)-(1 as :number)] when ((payload.statistics.diskWriteBytes pluck $) [(flowVars.varEeventcounter as :number)-(1 as :number)])!=null otherwise -2 as :number,
+	cpuMemTimestamp : (((payload.statistics.memoryTotalUsed pluck $$) [(flowVars.varEeventcounter as :number)-(1 as :number)]) as :string /1000) as :datetime as :string{format:'yyyy-MM-dd HH:mm:ss'} when ((payload.statistics.memoryTotalUsed pluck $$) [(flowVars.varEeventcounter as :number)-(1 as :number)])!=null otherwise '1950-01-01 00:01:01'
+	
+}]]></dw:set-payload>
+				</dw:transform-message>
+
+
+				<byte-array-to-string-transformer
+					doc:name="Byte Array to String" />
+				<logger message="#[payload]" level="INFO" doc:name="Logger" />
+
+				<db:insert config-ref="MySQL_Configuration" doc:name="Database">
+                    <db:parameterized-query><![CDATA[INSERT INTO t_worker_stats
+           (Application_Name
+           ,WORKER
+           ,Start_Time
+           ,End_Time
+           ,TIME_MILLI
+           ,TIME_STAMP
+           ,Memory_Percentage
+           ,Memory_Used
+           ,CPU_Percentage
+           ,EVENTS
+           ,EVENT_COUNT
+           ,CPU_COUNT
+           ,MEMORY_COUNT
+           ,MEMORY_PERCENT_COUNT
+           ,ENV_NAME
+           ,Network_In
+           ,Network_Out
+           ,DiskWrite_Bytes
+           ,DiskRead_Bytes
+           ,Metric_Time)
+     VALUES
+           (#[json:applicationName]
+           ,#[json:worker]
+           ,CONVERT(#[json:startTime], DATETIME)
+           ,CONVERT(#[json:endTime], DATETIME)
+           ,#[json:timeMilli]
+           ,CONVERT(#[json:timeStamp], DATETIME)
+           ,#[json:memoryPercentage]
+           ,#[json:memoryUsed]
+           ,#[json:cpu]
+           ,#[json:events]
+           ,#[json:eventsCount]
+           ,#[json:cpuCount]
+           ,#[json:memoryCount]
+           ,#[json:memorypercentCount]
+           ,#[json:envName]
+           ,#[json:networkIn]
+           ,#[json:networkOut]
+		   ,#[json:diskWriteBytes]
+           ,#[json:diskReadBytes]
+           ,CONVERT(#[json:cpuMemTimestamp], DATETIME));]]></db:parameterized-query>
+
+
+
+
+
+
+
+				</db:insert>
+			</foreach>
+		</foreach>
+		 <catch-exception-strategy doc:name="Catch Exception Strategy">
+			<logger message="ERROR:: #[message.exception]" level="INFO"
+				doc:name="Logger" />
+		</catch-exception-strategy> 
+
+		<!-- </foreach> -->
+	</flow>
+
+</mule>

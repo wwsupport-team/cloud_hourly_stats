@@ -1,0 +1,186 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<mule xmlns:context="http://www.springframework.org/schema/context" xmlns:schedulers="http://www.mulesoft.org/schema/mule/schedulers" xmlns:file="http://www.mulesoft.org/schema/mule/file" xmlns:db="http://www.mulesoft.org/schema/mule/db"
+	xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+	xmlns:dw="http://www.mulesoft.org/schema/mule/ee/dw"
+	xmlns:http="http://www.mulesoft.org/schema/mule/http" xmlns="http://www.mulesoft.org/schema/mule/core" xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xmlns:spring="http://www.springframework.org/schema/beans" 
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="http://www.mulesoft.org/schema/mule/db http://www.mulesoft.org/schema/mule/db/current/mule-db.xsd
+http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd
+http://www.mulesoft.org/schema/mule/ee/dw http://www.mulesoft.org/schema/mule/ee/dw/current/dw.xsd
+http://www.springframework.org/schema/beans http://www.springframework.org/schema/beans/spring-beans-current.xsd
+http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+http://www.mulesoft.org/schema/mule/file http://www.mulesoft.org/schema/mule/file/current/mule-file.xsd
+http://www.mulesoft.org/schema/mule/schedulers http://www.mulesoft.org/schema/mule/schedulers/current/mule-schedulers.xsd
+http://www.springframework.org/schema/context http://www.springframework.org/schema/context/spring-context-current.xsd">
+    <http:listener-config name="HTTP_Listener_Configuration" host="0.0.0.0" port="8081" doc:name="HTTP Listener Configuration"/>
+    <http:request-config name="Access_Management_Config" protocol="HTTPS" host="anypoint.mulesoft.com" port="443"  doc:name="HTTP Request Configuration" responseTimeout="60000">
+        <http:basic-authentication username="${anypoint.username}" password="${anypoint.password}"/>
+    </http:request-config>
+    <ee:object-store-caching-strategy name="Caching_Strategy_APIIds" keyGenerationExpression="#['APIVersionIds']" doc:name="Caching Strategy">
+        <in-memory-store name="APIVersionIds"/>
+    </ee:object-store-caching-strategy>
+   <!--  <spring:beans>
+        <spring:bean id="sqlserver" name="sqlserver" class="org.enhydra.jdbc.standard.StandardXADataSource">
+         <spring:property name="driverName" value="com.microsoft.sqlserver.jdbc.SQLServerDriver" />
+            <spring:property name="url" value="${db_url}" />
+            <spring:property name="user" value="${db_user}" />
+            <spring:property name="password" value="${db_password}" />
+            </spring:bean>
+    </spring:beans> 
+    <db:generic-config name="Generic_Database_Configuration" dataSource-ref="sqlserver" doc:name="Generic Database Configuration"/>-->
+    <ee:object-store-caching-strategy name="Caching_Strategy" keyGenerationExpression="#['Resources']" doc:name="Caching Strategy">
+        <in-memory-store name="ResourcePaths"/>
+    </ee:object-store-caching-strategy>
+   <!--  <db:mysql-config name="MySQL_Configuration" doc:name="MySQL Configuration"/> -->
+    <db:mysql-config name="MySQL_Configuration" host="${db_host}" port="${db_port}" user="${db_user}" password="${db_password}" database="${db_database}" doc:name="MySQL Configuration"/>
+    <context:property-placeholder location="cloud_hourly_and_metrics_stats.properties"/>
+    
+    
+    <flow name="cloud_hourly_statsFlow">
+        <poll doc:name="Poll">
+            <schedulers:cron-scheduler expression="${poll_cron_exp}"/>
+            <logger message="Poller" level="INFO" doc:name="Logger"/>
+        </poll>
+        <flow-ref name="cloudhubLogin" doc:name="CloudHub Login"/>
+        <expression-component doc:name="Expression"><![CDATA[import java.text.SimpleDateFormat;
+import java.util.Date;
+import java.util.Calendar;
+import java.util.TimeZone;
+
+Calendar calender= Calendar.getInstance(TimeZone.getTimeZone("${timezone}"));
+Date date = calender.getTime();
+
+SimpleDateFormat sdf=new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS");
+sdf.setTimeZone(TimeZone.getTimeZone("${timezone}"));
+
+//flowVars.varEndTime=server.dateTime.changeTimeZone("${timezone}").format("yyyy-MM-dd'T'HH:mm:ss.SSS");
+
+flowVars.varEndTime=sdf.format(date);
+
+calender.setTime(date);
+calender.add(Calendar.MINUTE, -10);
+Date delayDate = calender.getTime();
+flowVars.varStartTime=sdf.format(delayDate);
+
+//flowVars.varStartTime=server.dateTime.changeTimeZone("${timezone}").plusMinutes(-10).format("yyyy-MM-dd'T'HH:mm:ss.SSS");
+
+//flowVars.time=delayDate.getHours() + '-' + (delayDate.getHours() + 1);
+
+
+]]></expression-component>
+        <logger message="Time Stamps &gt;&gt; Start Time ::  #[flowVars.varStartTime] ===== End Time #[flowVars.varEndTime] and #[message]" level="INFO" doc:name="Logger"/>
+        <enricher target="#[variable:apiIds]" doc:name="Message Enricher">
+            <ee:cache cachingStrategy-ref="Caching_Strategy_APIIds" doc:name="Cache - Store API Id's">
+                <db:select config-ref="MySQL_Configuration" doc:name="Retrieve API version Id's">
+                    <db:parameterized-query><![CDATA[Select id, api_versionId, api_name, app_name, org_id, env_id, version_id, api_id, env_name, created_time from t_api_ids where toggle='ON';]]></db:parameterized-query>
+                </db:select>
+            </ee:cache>
+        </enricher>
+        <foreach collection="#[flowVars.apiIds]" doc:name="For Each (Iterating app names)">
+            <set-variable variableName="appName" value="#[payload.app_name]" doc:name="varApiId"/>
+            <!--<enricher target="#[variable:resourcePaths]" doc:name="Message Enricher">
+                 <ee:cache cachingStrategy-ref="Caching_Strategy" filterExpression="#[payload]" doc:name="Cache"> 
+                    <db:select config-ref="MySQL_Configuration" doc:name="Retrieve resource paths">
+                        <db:parameterized-query><![CDATA[Select id, resource_path, success_status_code, resource_http_verb, delay_time_ms, domain_name, env_name, app_name, search_criteria,resource_name,display_name,resource_order,created_time from t_resource_paths where app_name=#[flowVars.appName];]]></db:parameterized-query>
+                    </db:select>
+                 </ee:cache> 
+            </enricher>-->
+            <set-property propertyName="Content-Type" value="application/json" doc:name="Property"/>
+            <http:request config-ref="Access_Management_Config" path="/analytics/{version}/{orgId}/environments/{envId}/events" method="GET" doc:name="HTTP">
+                <http:request-builder>
+                    <http:query-param paramName="format" value="${format}"/>
+                    <http:query-param paramName="apiIds" value="#[payload.api_id]"/>
+                    <http:query-param paramName="fields" value="${fields}"/>
+                    <http:query-param paramName="apiVersionIds" value="#[payload.api_versionId]"/>
+                    <http:query-param paramName="countOnly" value="${count}"/>
+                    <http:query-param paramName="maxResults" value="${max_results}"/>
+                    <http:query-param paramName="startDate" value="#[flowVars.varStartTime]"/>
+                    <http:query-param paramName="endDate" value="#[flowVars.varEndTime]"/>
+                    <http:uri-param paramName="orgId" value="#[payload.org_id]"/>
+                    <http:uri-param paramName="version" value="#[payload.version_id]"/>
+                    <http:uri-param paramName="envId" value="#[payload.env_id]"/>
+                    <http:header headerName="Authorization" value="#[flowVars.access_token]"/>
+                </http:request-builder>
+            </http:request>
+            <dw:transform-message doc:name="Transform Message">
+                <dw:set-payload><![CDATA[%dw 1.0
+%output application/java 
+//skipNullOn="everywhere"
+//application/csv header=true, separator=','
+
+---
+payload map ((message, index) ->{
+
+	
+	Client_IP : message.'Client IP',
+	Message_ID : message.'Message ID',
+	API_ID : message.'API ID',
+	API_VERSION_ID : message.'API Version ID',
+	API_NAME : message.'API NAME',
+	Request_Time : message.Timestamp as :datetime as :string {format: "yyyy-MM-dd HH:mm:ss"},
+	Request_Size : message.'Request Size',
+	Response_Size : message.'Response Size',
+	Request_Outcome : message.'Request_Outcome',
+	Verb : message.'Verb',
+	Resource_Path : message.'Resource Path',
+	Status_Code : message.'Status Code',
+	Timezone : message.'Timezone',
+	Response_Time : message.'Response Time',
+	//((flowVars.resourcePaths groupBy $.display_name) filter (($[0].app_name) == (flowVars.appName) and ((message."Resource Path" == $.resource_path) and message."Verb" == $.resource_http_verb and $.search_criteria == "equals")) default [] map using (resourceData = $ reduce $$){
+	
+	//API_Name_External : resourceData.display_name 
+	//when (message."Resource Path" == resourceData.resource_path or message."Resource Path" contains resourceData.resource_path) and message."Verb" == resourceData.resource_http_verb and (resourceData.search_criteria == "equals" or resourceData.search_criteria == "matches")
+	
+//}),
+   //(flowVars.resourcePaths ($.resource_http_verb == message.Verb and $.resource_path == message."Resource Path" and $.search_criteria == "equals") default [] map {
+		// API_Name_External : '',
+	//}),
+	API_Name_External : '',
+   	API_Group : flowVars.appName,
+	User_Agent_Name : message.'User Agent Name',
+	User_Agent_Version : message.'User Agent Version',
+	Postal_Code : message.'Postal Code',
+	Start_Time : flowVars.varStartTime as :datetime as :string {format: "yyyy-MM-dd HH:mm:ss"},
+	End_Time : flowVars.varEndTime as :datetime as :string {format: "yyyy-MM-dd HH:mm:ss"}
+	
+})]]></dw:set-payload>
+            </dw:transform-message>
+            <logger message="&gt;&gt;&gt;&gt;Before bulk operation and App Name : #[flowVars.appName]" level="INFO" doc:name="Logger"/>
+            <!-- <foreach collection="#[payload]" doc:name="For Each"> -->
+               <!--  <async doc:name="Async"> -->
+                    <db:insert config-ref="MySQL_Configuration" bulkMode="true" doc:name="Database">
+                        <db:parameterized-query><![CDATA[INSERT INTO `hourly_stats`
+(`Client_IP`, `Message_ID`, `Request_Outcome`, `Request_Size`, `Resource_Path`, `Response_Size`, `Response_Time`, `Status_Code`, `Timezone`, `Verb`, `Request_Time`, `API_ID`, `API_Version_ID`, `API_Name`, `API_Version_Name`, `id`, `API_Name_External`, `API_Group`, `User_Agent_Name`, `User_Agent_Version`, `Postal_Code`, `Start_Time`, `End_Time`) VALUES ( #[payload.Client_IP], #[payload.Message_ID], #[payload.Request_Outcome], #[payload.Request_Size], #[payload.Resource_Path], #[payload.Response_Size], #[payload.Response_Time], #[payload.Status_Code], #[payload.Timezone], #[payload.Verb], #[payload.Request_Time], #[payload.API_ID], #[payload.API_Version_ID], #[payload.API_Name], #[payload.API_Version_Name], #[payload.id], #[payload.API_Name_External], #[payload.API_Group], #[payload.User_Agent_Name], #[payload.User_Agent_Version], #[payload.Postal_Code], #[payload.Start_Time], #[payload.End_Time] );]]></db:parameterized-query>
+                    </db:insert>
+            <logger message="&gt;&gt;&gt;&gt;Data inserted into db for App :: #[flowVars.appName]" level="INFO" doc:name="Logger"/>
+                <!-- </async> -->
+            <!-- </foreach> -->
+        </foreach>
+        <exception-strategy ref="cloud_hourly_statsChoice_Exception_Strategy" doc:name="Reference Exception Strategy"/>
+    </flow>
+    <sub-flow name="cloudhubLogin">
+        <dw:transform-message doc:name="Transform Message">
+            <dw:set-payload><![CDATA[%dw 1.0
+%output application/json
+---
+{ 
+	"username": "${anypoint.username}",  
+	"password": "${anypoint.password}"
+}]]></dw:set-payload>
+        </dw:transform-message>
+        <set-property propertyName="Content-Type" value="application/json" doc:name="Property"/>
+        <http:request config-ref="Access_Management_Config" path="/accounts/login" method="POST" doc:name="HTTP"/>
+    <set-variable variableName="access_token" value="#[json:access_token]" doc:name="Set Access_Token FlowVar"/>
+    <logger level="INFO" doc:name="Logger" message="End of cloudhubLogin sub-flow"/>
+</sub-flow>
+    <choice-exception-strategy name="cloud_hourly_statsChoice_Exception_Strategy">
+
+        <catch-exception-strategy doc:name="Catch Exception Strategy">
+            <logger level="INFO" doc:name="Logger"/>
+            <set-payload value="#[exception.message]" doc:name="Set Payload"/>
+        </catch-exception-strategy>
+    </choice-exception-strategy>
+</mule>
